@@ -34,6 +34,7 @@ class FakeClient:
         self.responses: list[tuple[Any, dict]] = []
         self.error_responses: list[tuple[Any, int, str]] = []
         self._initialized = False
+        self.initialize_calls: list[dict] = []
         self._closed = False
         self._notifications: list[dict] = []
         self._server_requests: list[dict] = []
@@ -41,6 +42,7 @@ class FakeClient:
 
     # API matching CodexAppServerClient
     def initialize(self, **kwargs):
+        self.initialize_calls.append(dict(kwargs))
         self._initialized = True
         return {"userAgent": "fake/0.0.0", "codexHome": "/tmp",
                 "platformOs": "linux", "platformFamily": "unix"}
@@ -161,6 +163,28 @@ class TestLifecycle:
         # thread/start should be called exactly once
         method_calls = [m for (m, _) in client.requests if m == "thread/start"]
         assert len(method_calls) == 1
+
+    def test_runtime_workspace_roots_opt_into_experimental_api(self):
+        client = FakeClient()
+        s = CodexAppServerSession(
+            cwd="/worktree",
+            runtime_workspace_roots=["/worktree"],
+            client_factory=lambda **kwargs: client,
+        )
+        s.ensure_started()
+
+        assert len(client.initialize_calls) == 1
+        assert client.initialize_calls[0]["capabilities"] == {
+            "experimentalApi": True
+        }
+
+    def test_plain_session_does_not_opt_into_experimental_api(self):
+        client = FakeClient()
+        s = make_session(client)
+        s.ensure_started()
+
+        assert len(client.initialize_calls) == 1
+        assert "capabilities" not in client.initialize_calls[0]
 
     def test_thread_start_passes_cwd_only(self):
         """thread/start carries cwd. We intentionally do NOT pass `permissions`

@@ -344,11 +344,17 @@ class CodexAppServerSession:
             if self._extra_args:
                 client_kwargs["extra_args"] = list(self._extra_args)
             self._client = self._client_factory(**client_kwargs)
-        self._client.initialize(
-            client_name="hermes",
-            client_title="Hermes Agent",
-            client_version=_get_hermes_version(),
-        )
+        initialize_kwargs: dict[str, Any] = {
+            "client_name": "hermes",
+            "client_title": "Hermes Agent",
+            "client_version": _get_hermes_version(),
+        }
+        if self._runtime_workspace_roots is not None:
+            # Codex gates runtimeWorkspaceRoots behind the connection-level
+            # experimentalApi capability. Opt in only for sessions that
+            # actually send that experimental field.
+            initialize_kwargs["capabilities"] = {"experimentalApi": True}
+        self._client.initialize(**initialize_kwargs)
         # Permission selection is intentionally NOT sent on thread/start.
         # Two reasons (live-tested against codex 0.130.0):
         #   1. `thread/start.permissions` is gated behind the experimentalApi
