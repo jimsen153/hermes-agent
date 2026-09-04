@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import subprocess
 import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
@@ -680,6 +682,119 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     return on_event
 
 
+def _require_hardened_codex_linked_worktree(cwd: str) -> str:
+    """Return the canonical linked-worktree root or fail closed.
+
+    Hardened delegated Codex workers may write source files but must not
+    receive write access to the Git index, refs, objects, or worktree
+    administrative metadata. Require a linked worktree whose Git metadata
+    resolves outside the writable workspace root.
+    """
+    root = os.path.realpath(os.path.abspath(os.path.expanduser(str(cwd))))
+    if not os.path.isdir(root):
+        raise RuntimeError(
+            "Hardened Codex subagent workspace must be an existing directory: "
+            f"{root}"
+        )
+
+    from tools.environments.local import build_subprocess_env
+
+    env = build_subprocess_env(inherit_profile_home=False)
+
+    # Repository topology must come only from cwd + disk state. Ambient Git
+    # process overrides could otherwise redirect rev-parse at another repo.
+    for key in list(env):
+        if key.startswith("GIT_"):
+            env.pop(key, None)
+
+    git_bin = shutil.which("git", path=env.get("PATH"))
+    if not git_bin:
+        raise RuntimeError(
+            "Hardened Codex subagent requires git for linked-worktree "
+            "topology verification."
+        )
+
+    try:
+        probe = subprocess.run(
+            [
+                git_bin,
+                "-C",
+                root,
+                "rev-parse",
+                "--path-format=absolute",
+                "--show-toplevel",
+                "--git-dir",
+                "--git-common-dir",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            "Hardened Codex subagent could not verify linked-worktree "
+            "topology."
+        ) from exc
+
+    lines = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
+    if probe.returncode != 0 or len(lines) != 3:
+        raise RuntimeError(
+            "Hardened Codex subagent requires cwd to be the top level of "
+            "a linked Git worktree."
+        )
+
+    top_level, git_dir, common_dir = (
+        os.path.realpath(os.path.abspath(value))
+        for value in lines
+    )
+
+    if top_level != root:
+        raise RuntimeError(
+            "Hardened Codex subagent requires cwd to equal the linked "
+            f"worktree top level: {top_level}"
+        )
+
+    dot_git = os.path.join(root, ".git")
+    if not os.path.isfile(dot_git) or os.path.islink(dot_git):
+        raise RuntimeError(
+            "Hardened Codex subagent requires a standard linked-worktree "
+            ".git file."
+        )
+
+    if not os.path.isdir(git_dir) or not os.path.isdir(common_dir):
+        raise RuntimeError(
+            "Hardened Codex subagent Git metadata directories are invalid."
+        )
+
+    def _within(path_value: str, root_value: str) -> bool:
+        try:
+            return os.path.commonpath([path_value, root_value]) == root_value
+        except ValueError:
+            return False
+
+    # A primary checkout or separate-git-dir checkout has one administrative
+    # Git directory. A linked worktree has a per-worktree git_dir nested under
+    # the common metadata directory.
+    if git_dir == common_dir or not _within(git_dir, common_dir):
+        raise RuntimeError(
+            "Hardened Codex subagent requires a linked Git worktree, not "
+            "a primary checkout."
+        )
+
+    if _within(git_dir, root) or _within(common_dir, root):
+        raise RuntimeError(
+            "Hardened Codex subagent refuses a workspace whose Git metadata "
+            "is inside its writable root."
+        )
+
+    return root
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -722,6 +837,13 @@ def run_codex_app_server_turn(
         from agent.runtime_cwd import resolve_agent_cwd
 
         cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
+        hardened_subagent = (
+            getattr(agent, "platform", None) == "subagent"
+            and getattr(agent, "api_mode", None) == "codex_app_server"
+        )
+        if hardened_subagent:
+            cwd = _require_hardened_codex_linked_worktree(cwd)
+
         # Approval callback: defer to Hermes' standard prompt flow if a
         # CLI thread has installed one. Gateway / cron contexts get the
         # codex-side fail-closed default.
@@ -729,6 +851,12 @@ def run_codex_app_server_turn(
             from tools.terminal_tool import _get_approval_callback
             approval_callback = _get_approval_callback()
         except Exception:
+            approval_callback = None
+
+        # Hardened delegated workers never surface or inherit approval
+        # escalation. Their Codex protocol policy is approvalPolicy=never,
+        # and Hermes-side server requests remain deny-only as defense in depth.
+        if hardened_subagent:
             approval_callback = None
 
         # Gateway / cron contexts have no UI to surface codex's approval
@@ -741,16 +869,17 @@ def run_codex_app_server_turn(
         # with a missing Hermes UI. Defaults (manual/smart/unset) preserve the
         # current fail-closed behavior — this is a no-op for those users.
         auto_approve_requests = False
-        try:
-            from tools.approval import is_approval_bypass_active
+        if not hardened_subagent:
+            try:
+                from tools.approval import is_approval_bypass_active
 
-            auto_approve_requests = is_approval_bypass_active()
-        except Exception:
-            logger.debug(
-                "codex app-server: approval-bypass lookup failed; "
-                "keeping fail-closed default",
-                exc_info=True,
-            )
+                auto_approve_requests = is_approval_bypass_active()
+            except Exception:
+                logger.debug(
+                    "codex app-server: approval-bypass lookup failed; "
+                    "keeping fail-closed default",
+                    exc_info=True,
+                )
 
         # Bridge codex JSON-RPC notifications (item/started, item/completed,
         # item/agentMessage/delta, ...) into Hermes' gateway UI callbacks
@@ -759,15 +888,71 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
-        agent._codex_session = CodexAppServerSession(
-            cwd=cwd,
-            approval_callback=approval_callback,
-            request_routing=_ServerRequestRouting(
+        session_kwargs: dict[str, Any] = {
+            "cwd": cwd,
+            "approval_callback": approval_callback,
+            "request_routing": _ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
                 auto_approve_apply_patch=auto_approve_requests,
             ),
-            on_event=make_codex_app_server_event_bridge(agent),
-        )
+            "on_event": make_codex_app_server_event_bridge(agent),
+        }
+
+        if hardened_subagent:
+            sandbox_policy = {
+                "type": "workspaceWrite",
+                "writableRoots": [cwd],
+                "networkAccess": False,
+                "excludeTmpdirEnvVar": True,
+                "excludeSlashTmp": True,
+            }
+            session_kwargs.update(
+                {
+                    "extra_args": [
+                        "--disable",
+                        "multi_agent",
+                        "--disable",
+                        "multi_agent_v2",
+                        "--disable",
+                        "apps",
+                        "--disable",
+                        "browser_use",
+                        "--disable",
+                        "browser_use_external",
+                        "--disable",
+                        "browser_use_full_cdp_access",
+                        "--disable",
+                        "computer_use",
+                        "--disable",
+                        "in_app_browser",
+                        "--disable",
+                        "plugins",
+                        "--disable",
+                        "remote_plugin",
+                        "--disable",
+                        "plugin_sharing",
+                        "--disable",
+                        "hooks",
+                        "--disable",
+                        "image_generation",
+                        "--disable",
+                        "workspace_dependencies",
+                        "--disable",
+                        "skill_mcp_dependency_install",
+                        "--disable",
+                        "auth_elicitation",
+                        "--disable",
+                        "tool_call_mcp_elicitation",
+                    ],
+                    "model": agent.model,
+                    "runtime_workspace_roots": [cwd],
+                    "approval_policy": "never",
+                    "sandbox_mode": "workspace-write",
+                    "sandbox_policy": sandbox_policy,
+                }
+            )
+
+        agent._codex_session = CodexAppServerSession(**session_kwargs)
 
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early

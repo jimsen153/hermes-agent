@@ -12,6 +12,7 @@ Verifies that:
 
 from __future__ import annotations
 
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +20,50 @@ import pytest
 
 import run_agent
 from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
+
+
+def _make_linked_worktree(tmp_path):
+    main = tmp_path / "main"
+    worker = tmp_path / "worker"
+    main.mkdir()
+
+    subprocess.run(["git", "-C", str(main), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(main), "config", "user.name", "Codex Test"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(main),
+            "config",
+            "user.email",
+            "codex-test@example.invalid",
+        ],
+        check=True,
+    )
+    (main / "tracked.txt").write_text("baseline\n")
+    subprocess.run(["git", "-C", str(main), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(main), "commit", "-q", "-m", "baseline"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(main),
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "worker-test",
+            str(worker),
+        ],
+        check=True,
+    )
+    return worker
 
 
 @pytest.fixture
@@ -402,6 +447,136 @@ class TestRunConversationCodexPath:
             CodexAppServerSession, "ensure_started", lambda self: "thread-stub-1"
         )
         return captured
+
+    def test_subagent_codex_session_gets_hardened_worker_policy(
+        self, monkeypatch, tmp_path
+    ):
+        captured = self._capture_routing_agent(monkeypatch)
+        worktree = _make_linked_worktree(tmp_path)
+
+        # Ambient Git routing must not influence the topology preflight.
+        monkeypatch.setenv("GIT_DIR", str(tmp_path / "bogus-git-dir"))
+        monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "bogus-work-tree"))
+
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"approvals": {"mode": "off"}},
+        ):
+            agent = _make_codex_agent(platform="subagent")
+            agent.session_cwd = str(worktree)
+            agent.model = "gpt-test-worker"
+
+            with patch.object(
+                agent, "_spawn_background_review", return_value=None
+            ):
+                agent.run_conversation("write something")
+
+        assert captured["cwd"] == str(worktree.resolve())
+        assert captured["extra_args"] == [
+            "--disable",
+            "multi_agent",
+            "--disable",
+            "multi_agent_v2",
+            "--disable",
+            "apps",
+            "--disable",
+            "browser_use",
+            "--disable",
+            "browser_use_external",
+            "--disable",
+            "browser_use_full_cdp_access",
+            "--disable",
+            "computer_use",
+            "--disable",
+            "in_app_browser",
+            "--disable",
+            "plugins",
+            "--disable",
+            "remote_plugin",
+            "--disable",
+            "plugin_sharing",
+            "--disable",
+            "hooks",
+            "--disable",
+            "image_generation",
+            "--disable",
+            "workspace_dependencies",
+            "--disable",
+            "skill_mcp_dependency_install",
+            "--disable",
+            "auth_elicitation",
+            "--disable",
+            "tool_call_mcp_elicitation",
+        ]
+        assert captured["model"] == "gpt-test-worker"
+        assert captured["runtime_workspace_roots"] == [str(worktree.resolve())]
+        assert captured["approval_policy"] == "never"
+        assert captured["sandbox_mode"] == "workspace-write"
+        assert captured["sandbox_policy"] == {
+            "type": "workspaceWrite",
+            "writableRoots": [str(worktree.resolve())],
+            "networkAccess": False,
+            "excludeTmpdirEnvVar": True,
+            "excludeSlashTmp": True,
+        }
+
+        # Defense in depth: approval bypass/yolo must not leak into the
+        # dedicated Codex worker.
+        assert captured["approval_callback"] is None
+        routing = captured["request_routing"]
+        assert routing.auto_approve_exec is False
+        assert routing.auto_approve_apply_patch is False
+
+    def test_hardened_preflight_rejects_primary_checkout(
+        self, tmp_path
+    ):
+        from agent.codex_runtime import (
+            _require_hardened_codex_linked_worktree,
+        )
+
+        repo = tmp_path / "primary"
+        repo.mkdir()
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+
+        with pytest.raises(RuntimeError, match="linked-worktree"):
+            _require_hardened_codex_linked_worktree(str(repo))
+
+    def test_hardened_preflight_rejects_non_git_directory(
+        self, tmp_path
+    ):
+        from agent.codex_runtime import (
+            _require_hardened_codex_linked_worktree,
+        )
+
+        workspace = tmp_path / "not-a-repo"
+        workspace.mkdir()
+
+        with pytest.raises(RuntimeError, match="linked Git worktree"):
+            _require_hardened_codex_linked_worktree(str(workspace))
+
+
+    def test_non_subagent_codex_session_keeps_existing_policy_surface(
+        self, monkeypatch
+    ):
+        captured = self._capture_routing_agent(monkeypatch)
+
+        agent = _make_codex_agent(platform="cli")
+        with patch.object(
+            agent, "_spawn_background_review", return_value=None
+        ):
+            agent.run_conversation("read something")
+
+        # Worker-only hardening must not silently change normal app-server
+        # sessions.
+        for key in (
+            "extra_args",
+            "model",
+            "runtime_workspace_roots",
+            "approval_policy",
+            "sandbox_mode",
+            "sandbox_policy",
+        ):
+            assert key not in captured
 
     def test_approvals_mode_off_auto_approves_codex_server_requests(
         self, monkeypatch

@@ -277,6 +277,12 @@ class CodexAppServerSession:
         cwd: Optional[str] = None,
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
+        extra_args: Optional[list[str]] = None,
+        model: Optional[str] = None,
+        runtime_workspace_roots: Optional[list[str]] = None,
+        approval_policy: Optional[Any] = None,
+        sandbox_mode: Optional[str] = None,
+        sandbox_policy: Optional[dict[str, Any]] = None,
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
@@ -286,6 +292,18 @@ class CodexAppServerSession:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        self._extra_args = list(extra_args or [])
+        self._model = model
+        self._runtime_workspace_roots = (
+            list(runtime_workspace_roots)
+            if runtime_workspace_roots is not None
+            else None
+        )
+        self._approval_policy = approval_policy
+        self._sandbox_mode = sandbox_mode
+        self._sandbox_policy = (
+            dict(sandbox_policy) if sandbox_policy is not None else None
+        )
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
@@ -319,9 +337,13 @@ class CodexAppServerSession:
         if self._thread_id is not None:
             return self._thread_id
         if self._client is None:
-            self._client = self._client_factory(
-                codex_bin=self._codex_bin, codex_home=self._codex_home
-            )
+            client_kwargs: dict[str, Any] = {
+                "codex_bin": self._codex_bin,
+                "codex_home": self._codex_home,
+            }
+            if self._extra_args:
+                client_kwargs["extra_args"] = list(self._extra_args)
+            self._client = self._client_factory(**client_kwargs)
         self._client.initialize(
             client_name="hermes",
             client_title="Hermes Agent",
@@ -343,6 +365,14 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
+        if self._model:
+            params["model"] = self._model
+        if self._runtime_workspace_roots is not None:
+            params["runtimeWorkspaceRoots"] = list(self._runtime_workspace_roots)
+        if self._approval_policy is not None:
+            params["approvalPolicy"] = self._approval_policy
+        if self._sandbox_mode is not None:
+            params["sandbox"] = self._sandbox_mode
         result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
@@ -524,6 +554,23 @@ class CodexAppServerSession:
                 {
                     "threadId": self._thread_id,
                     "input": [{"type": "text", "text": user_input_text}],
+                    **({"cwd": self._cwd} if self._sandbox_policy is not None else {}),
+                    **(
+                        {"runtimeWorkspaceRoots": list(self._runtime_workspace_roots)}
+                        if self._runtime_workspace_roots is not None
+                        else {}
+                    ),
+                    **(
+                        {"approvalPolicy": self._approval_policy}
+                        if self._approval_policy is not None
+                        else {}
+                    ),
+                    **(
+                        {"sandboxPolicy": dict(self._sandbox_policy)}
+                        if self._sandbox_policy is not None
+                        else {}
+                    ),
+                    **({"model": self._model} if self._model else {}),
                 },
                 timeout=10,
             )

@@ -174,6 +174,81 @@ class TestLifecycle:
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
 
+    def test_extra_args_forwarded_to_client_factory(self):
+        captured = {}
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return FakeClient()
+
+        s = CodexAppServerSession(
+            cwd="/tmp",
+            extra_args=["--disable", "multi_agent"],
+            client_factory=factory,
+        )
+        s.ensure_started()
+
+        assert captured["codex_bin"] == "codex"
+        assert captured["codex_home"] is None
+        assert captured["extra_args"] == ["--disable", "multi_agent"]
+
+    def test_explicit_protocol_policy_reasserted_on_thread_and_turn(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/started",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001"},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+
+        sandbox_policy = {
+            "type": "workspaceWrite",
+            "writableRoots": ["/worktree"],
+            "networkAccess": False,
+            "excludeTmpdirEnvVar": True,
+            "excludeSlashTmp": True,
+        }
+
+        s = CodexAppServerSession(
+            cwd="/worktree",
+            model="gpt-test-worker",
+            runtime_workspace_roots=["/worktree"],
+            approval_policy="never",
+            sandbox_mode="workspace-write",
+            sandbox_policy=sandbox_policy,
+            client_factory=lambda **kwargs: client,
+        )
+
+        s.run_turn("hi", turn_timeout=2.0)
+
+        _, thread_params = next(
+            r for r in client.requests if r[0] == "thread/start"
+        )
+        assert thread_params == {
+            "cwd": "/worktree",
+            "model": "gpt-test-worker",
+            "runtimeWorkspaceRoots": ["/worktree"],
+            "approvalPolicy": "never",
+            "sandbox": "workspace-write",
+        }
+
+        _, turn_params = next(
+            r for r in client.requests if r[0] == "turn/start"
+        )
+        assert turn_params == {
+            "threadId": "thread-fake-001",
+            "input": [{"type": "text", "text": "hi"}],
+            "cwd": "/worktree",
+            "runtimeWorkspaceRoots": ["/worktree"],
+            "approvalPolicy": "never",
+            "sandboxPolicy": sandbox_policy,
+            "model": "gpt-test-worker",
+        }
+
     def test_close_idempotent(self):
         client = FakeClient()
         s = make_session(client)

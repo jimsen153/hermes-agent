@@ -1005,6 +1005,75 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertIsNone(creds["api_mode"])
         self.assertIsNone(creds["model"])
 
+    def test_inherit_openai_codex_can_select_codex_app_server(self):
+        parent = _make_mock_parent(depth=0)
+        parent.provider = "openai-codex"
+        parent.api_mode = "codex_responses"
+
+        creds = _resolve_delegation_credentials(
+            {
+                "model": "",
+                "provider": "",
+                "api_mode": "codex_app_server",
+            },
+            parent,
+        )
+
+        self.assertIsNone(creds["provider"])
+        self.assertIsNone(creds["base_url"])
+        self.assertIsNone(creds["api_key"])
+        self.assertEqual(creds["api_mode"], "codex_app_server")
+
+    def test_inherit_openai_can_select_codex_app_server(self):
+        parent = _make_mock_parent(depth=0)
+        parent.provider = "openai"
+        parent.api_mode = "chat_completions"
+
+        creds = _resolve_delegation_credentials(
+            {
+                "model": "",
+                "provider": "",
+                "api_mode": "codex_app_server",
+            },
+            parent,
+        )
+
+        self.assertEqual(creds["api_mode"], "codex_app_server")
+
+    def test_inherit_codex_app_server_rejects_non_openai_parent(self):
+        parent = _make_mock_parent(depth=0)
+        parent.provider = "openrouter"
+        parent.api_mode = "chat_completions"
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "requires an inherited OpenAI or OpenAI-Codex parent provider",
+        ):
+            _resolve_delegation_credentials(
+                {
+                    "model": "",
+                    "provider": "",
+                    "api_mode": "codex_app_server",
+                },
+                parent,
+            )
+
+    def test_inherit_other_api_mode_values_keep_legacy_behavior(self):
+        parent = _make_mock_parent(depth=0)
+        parent.provider = "openai-codex"
+        parent.api_mode = "codex_responses"
+
+        creds = _resolve_delegation_credentials(
+            {
+                "model": "",
+                "provider": "",
+                "api_mode": "chat_completions",
+            },
+            parent,
+        )
+
+        self.assertIsNone(creds["api_mode"])
+
     def test_direct_endpoint_uses_configured_base_url_and_api_key(self):
         parent = _make_mock_parent(depth=0)
         cfg = {

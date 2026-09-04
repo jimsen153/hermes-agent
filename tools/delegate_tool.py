@@ -4910,12 +4910,29 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         # in pure-inherit setups (never a silent no-op). None when neither
         # side has values → _build_child_agent falls back to the parent's
         # request_overrides unchanged.
+        # Operator-only transport selector for inherited OpenAI runtimes.
+        # This lets a delegated child use the local Codex app-server without
+        # changing the parent runtime. Fail closed for non-OpenAI providers.
+        inherited_api_mode = None
+        if configured_api_mode == "codex_app_server":
+            inherited_provider = str(
+                getattr(parent_agent, "provider", None) or ""
+            ).strip().lower()
+            if inherited_provider not in {"openai", "openai-codex"}:
+                raise ValueError(
+                    "delegation.api_mode=codex_app_server requires an inherited "
+                    "OpenAI or OpenAI-Codex parent provider; got "
+                    + repr(inherited_provider or "unset")
+                    + "."
+                )
+            inherited_api_mode = "codex_app_server"
+
         return {
             "model": configured_model,
             "provider": None,
             "base_url": None,
             "api_key": None,
-            "api_mode": None,
+            "api_mode": inherited_api_mode,
             "request_overrides": _merge_request_overrides(
                 getattr(parent_agent, "request_overrides", None),
                 explicit_request_overrides,
