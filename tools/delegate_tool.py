@@ -3879,6 +3879,7 @@ def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
+    specialist: Optional[str] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
@@ -3988,9 +3989,12 @@ def delegate_task(
     # uses it to route its reviewer subagent onto ``auxiliary.review``
     # without touching the global delegation pin.
     try:
-        creds = _resolve_delegation_credentials(
-            credentials_cfg if credentials_cfg else cfg, parent_agent
+        routing_cfg = _select_delegation_credentials_cfg(
+            cfg,
+            specialist,
+            credentials_cfg=credentials_cfg,
         )
+        creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -4754,6 +4758,67 @@ def _merge_request_overrides(runtime_overrides, explicit_overrides):
     return merged or None
 
 
+def _select_delegation_credentials_cfg(
+    cfg: dict,
+    specialist: Optional[str],
+    credentials_cfg: Optional[Dict[str, Any]] = None,
+) -> dict:
+    """Select the operator-owned credential config for one delegation call.
+
+    Precedence:
+      1. Internal credentials_cfg override (never model-facing).
+      2. Model-selected semantic specialist mapped through delegation.specialists.
+      3. Existing top-level delegation routing config.
+
+    The model chooses only a semantic specialist name. Provider, model,
+    endpoint, API mode, and credentials remain operator-controlled config.
+    """
+    if credentials_cfg:
+        return credentials_cfg
+
+    specialist_name = str(specialist or "").strip().lower()
+    if not specialist_name:
+        return cfg
+
+    specialists = cfg.get("specialists")
+    if not isinstance(specialists, dict):
+        raise ValueError(
+            f"Delegation specialist {specialist_name!r} was requested, but "
+            "delegation.specialists is not configured."
+        )
+
+    available = sorted(
+        str(name).strip().lower()
+        for name, value in specialists.items()
+        if isinstance(name, str) and name.strip() and isinstance(value, dict)
+    )
+
+    selected = None
+    for raw_name, value in specialists.items():
+        if (
+            isinstance(raw_name, str)
+            and raw_name.strip().lower() == specialist_name
+        ):
+            selected = value
+            break
+
+    if selected is None:
+        available_text = ", ".join(available) if available else "none"
+        raise ValueError(
+            f"Unknown delegation specialist {specialist_name!r}. "
+            f"Configured specialists: {available_text}."
+        )
+
+    if not isinstance(selected, dict):
+        raise ValueError(
+            f"delegation.specialists.{specialist_name} must be a mapping."
+        )
+
+    # Return an isolated shallow copy. _resolve_delegation_credentials reads
+    # this mapping but must never mutate the operator config object.
+    return dict(selected)
+
+
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """Resolve credentials for subagent delegation.
 
@@ -5106,8 +5171,9 @@ def _build_top_level_description() -> str:
         "require a verifiable handle (URL, ID, absolute path) and verify it "
         "yourself before telling the user the operation succeeded.\n"
         + restrictions_rule +
-        "- Children inherit the parent model unless pinned via "
-        "delegation.provider / delegation.model in config.yaml."
+        "- Children inherit the parent routing unless operator config pins "
+        "delegation.provider / delegation.model, or this call selects a "
+        "configured semantic specialist."
     )
 
 
@@ -5161,6 +5227,35 @@ def _build_dynamic_schema_overrides() -> dict:
         k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
+
+    try:
+        cfg = _load_config()
+        raw_specialists = cfg.get("specialists")
+        specialist_names = sorted(
+            str(name).strip().lower()
+            for name, value in (
+                raw_specialists.items()
+                if isinstance(raw_specialists, dict)
+                else []
+            )
+            if isinstance(name, str)
+            and name.strip()
+            and isinstance(value, dict)
+        )
+    except Exception:
+        specialist_names = []
+
+    if specialist_names:
+        overrides_params["properties"]["specialist"] = {
+            "type": "string",
+            "enum": specialist_names,
+            "description": (
+                "Semantic specialist for this delegation call. Applies to all "
+                "tasks in the call. The operator configuration maps this name "
+                "to the actual provider/model; you cannot choose provider, "
+                "model, endpoint, credentials, or transport directly."
+            ),
+        }
 
     return {
         "description": _build_top_level_description(),
@@ -5326,6 +5421,7 @@ registry.register(
         goal=args.get("goal"),
         context=args.get("context"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
+        specialist=args.get("specialist"),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),

@@ -30,6 +30,8 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _select_delegation_credentials_cfg,
+    _build_dynamic_schema_overrides,
 )
 from hermes_state import SessionDB
 
@@ -991,6 +993,129 @@ class TestBlockedTools(unittest.TestCase):
         (Teknium, Jul 2026)."""
         self.assertNotIn("execute_code", DELEGATE_BLOCKED_TOOLS)
 
+class TestDelegationSpecialistRouting(unittest.TestCase):
+    def test_no_specialist_preserves_existing_delegation_config(self):
+        cfg = {
+            "provider": "openrouter",
+            "model": "example-model",
+        }
+        selected = _select_delegation_credentials_cfg(cfg, None)
+        self.assertIs(selected, cfg)
+
+    def test_specialist_selects_operator_owned_route(self):
+        cfg = {
+            "provider": "openrouter",
+            "model": "default-model",
+            "specialists": {
+                "critic": {
+                    "provider": "xai",
+                    "model": "grok-test",
+                },
+            },
+        }
+
+        selected = _select_delegation_credentials_cfg(cfg, "critic")
+
+        self.assertEqual(
+            selected,
+            {
+                "provider": "xai",
+                "model": "grok-test",
+            },
+        )
+        self.assertIsNot(selected, cfg["specialists"]["critic"])
+
+    def test_unknown_specialist_fails_closed(self):
+        cfg = {
+            "specialists": {
+                "critic": {"provider": "xai", "model": "grok-test"},
+                "analyst": {
+                    "provider": "deepseek",
+                    "model": "deepseek-v4-pro",
+                },
+            },
+        }
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Unknown delegation specialist.*Configured specialists: analyst, critic",
+        ):
+            _select_delegation_credentials_cfg(cfg, "coder")
+
+    def test_internal_credentials_override_specialist_selection(self):
+        cfg = {
+            "specialists": {
+                "critic": {"provider": "xai", "model": "grok-test"},
+            },
+        }
+        internal = {
+            "provider": "openrouter",
+            "model": "internal-review-model",
+        }
+
+        selected = _select_delegation_credentials_cfg(
+            cfg,
+            "critic",
+            credentials_cfg=internal,
+        )
+        self.assertIs(selected, internal)
+
+    def test_empty_internal_credentials_cfg_preserves_existing_config(self):
+        cfg = {
+            "provider": "openrouter",
+            "model": "default-model",
+            "specialists": {
+                "critic": {"provider": "xai", "model": "grok-test"},
+            },
+        }
+
+        selected = _select_delegation_credentials_cfg(
+            cfg,
+            None,
+            credentials_cfg={},
+        )
+
+        self.assertIs(selected, cfg)
+
+    @patch("tools.delegate_tool._load_config")
+    def test_dynamic_schema_advertises_only_configured_specialists(self, mock_cfg):
+        mock_cfg.return_value = {
+            "max_concurrent_children": 1,
+            "specialists": {
+                "critic": {"provider": "xai", "model": "grok-test"},
+                "analyst": {
+                    "provider": "deepseek",
+                    "model": "deepseek-v4-pro",
+                },
+                "broken": "not-a-mapping",
+            },
+        }
+
+        schema = _build_dynamic_schema_overrides()
+        props = schema["parameters"]["properties"]
+
+        self.assertEqual(
+            props["specialist"]["enum"],
+            ["analyst", "critic"],
+        )
+        self.assertNotIn("provider", props)
+        self.assertNotIn("model", props)
+        self.assertNotIn("api_key", props)
+        self.assertNotIn("base_url", props)
+        self.assertNotIn("api_mode", props)
+
+    @patch("tools.delegate_tool._load_config")
+    def test_dynamic_schema_omits_specialist_without_operator_config(self, mock_cfg):
+        mock_cfg.return_value = {"max_concurrent_children": 1}
+
+        schema = _build_dynamic_schema_overrides()
+
+        self.assertNotIn(
+            "specialist",
+            schema["parameters"]["properties"],
+        )
+
+
 class TestDelegationCredentialResolution(unittest.TestCase):
     """Tests for provider:model credential resolution in delegation config."""
 
@@ -1214,6 +1339,62 @@ class TestDelegationCredentialResolution(unittest.TestCase):
 
 class TestDelegationProviderIntegration(unittest.TestCase):
     """Integration tests: delegation config → _run_single_child → AIAgent construction."""
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_specialist_route_reaches_credential_resolution_and_child(
+        self, mock_creds, mock_cfg
+    ):
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "specialists": {
+                "critic": {
+                    "provider": "xai",
+                    "model": "grok-test",
+                },
+            },
+        }
+        mock_creds.return_value = {
+            "model": "grok-test",
+            "provider": "xai",
+            "base_url": "https://api.x.ai/v1",
+            "api_key": "test-xai-key",
+            "api_mode": "codex_responses",
+            "request_overrides": {},
+            "max_output_tokens": None,
+        }
+
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(
+                goal="Challenge this architecture",
+                specialist="critic",
+                parent_agent=parent,
+            )
+
+            mock_creds.assert_called_once_with(
+                {
+                    "provider": "xai",
+                    "model": "grok-test",
+                },
+                parent,
+            )
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["provider"], "xai")
+            self.assertEqual(kwargs["model"], "grok-test")
+            self.assertEqual(kwargs["base_url"], "https://api.x.ai/v1")
+            self.assertEqual(kwargs["api_key"], "test-xai-key")
+            self.assertEqual(kwargs["api_mode"], "codex_responses")
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -1723,6 +1904,33 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertEqual(captured["goal"], "test")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
+
+    def test_specialist_forwarded_by_live_dispatch(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "tasks": [{"goal": "Challenge the architecture"}],
+                    "specialist": "critic",
+                },
+            )
+
+        self.assertEqual(captured["specialist"], "critic")
+        self.assertNotIn("provider", captured)
+        self.assertNotIn("model", captured)
+        self.assertNotIn("api_key", captured)
+        self.assertNotIn("base_url", captured)
+        self.assertNotIn("api_mode", captured)
+
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
