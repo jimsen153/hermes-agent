@@ -1364,13 +1364,28 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
             if data.get("success") is False and "exceed the limit" in data.get("error", ""):
                 return True, " [full]"
 
-    # Structured error in JSON result (any tool that surfaces {"error": ...}).
+    # Structured JSON results must be classified from their values, not by
+    # scanning their serialized key names. In particular, an explicit
+    # {"error": null} is a common success shape and must not become a
+    # false-positive merely because the literal key name contains "error".
     if isinstance(data, dict):
-        err = data.get("error") or data.get("message")
-        if err and (data.get("success") is False or "error" in data):
-            return True, f" [{_trim_error(str(err))}]"
+        err = data.get("error")
+        message = data.get("message")
+        status = str(data.get("status") or "").strip().lower()
 
-    # Generic heuristic for non-terminal tools
+        failed = (
+            data.get("success") is False
+            or data.get("failed") is True
+            or status in {"error", "failed", "failure"}
+            or bool(err)
+        )
+        if failed:
+            detail = err or message or status or "error"
+            return True, f" [{_trim_error(str(detail))}]"
+
+        return False, ""
+
+    # Generic heuristic for non-JSON / non-mapping tool results
     # Multimodal tool results (dicts with _multimodal=True) are not strings —
     # treat them as successes since failures would be JSON-encoded strings.
     if not isinstance(result, str):

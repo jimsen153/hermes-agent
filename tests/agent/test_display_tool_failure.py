@@ -97,6 +97,16 @@ class TestDetectToolFailureStructured:
         assert _detect_tool_failure("web_search", result) == (False, "")
 
 
+    def test_null_error_field_not_flagged(self):
+        result = json.dumps({
+            "status": "completed",
+            "completion_state": "COMPLETED",
+            "error": None,
+            "output_files": ["/tmp/output.mp4"],
+        })
+        assert _detect_tool_failure("creative_request", result) == (False, "")
+
+
 
 class TestGetCuteToolMessageFailureSuffix:
     """End-to-end: failure suffix is appended by get_cute_tool_message."""
